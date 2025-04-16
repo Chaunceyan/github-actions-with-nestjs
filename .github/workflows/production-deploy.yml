@@ -1,4 +1,5 @@
 name: production-deploy
+
 on:
   push:
     branches: [master]
@@ -11,23 +12,56 @@ jobs:
         node-version: [18.x]
 
     steps:
-      - name: Copy repository
+      - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Use Node.js ${{ matrix.node-version }}
+      - name: Set up Node.js ${{ matrix.node-version }}
         uses: actions/setup-node@v3
         with:
           node-version: ${{ matrix.node-version }}
 
-      - name: Build and Package Docker Image
-        run: |
-          docker build --target prod -t aguirresabino/app .
-          docker save aguirresabino/app | gzip > app.tgz
+      - name: Cache Node.js dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
 
-      # - name: Configure SSH Key
-      #   uses: webfactory/ssh-agent@v0.4.0
-      #   with:
-      #     ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+      - name: Install dependencies
+        run: npm ci
+
+      # ----------- Docker Buildx & Caching Setup -----------
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cache Docker layers
+        uses: actions/cache@v3
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-docker-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-docker-
+
+      - name: Build and Package Docker Image in Memory with Caching
+        run: |
+          mkdir -p /dev/shm/docker-tmp
+          docker buildx build \
+            --builder default \
+            --target prod \
+            --cache-from=type=local,src=/tmp/.buildx-cache \
+            --cache-to=type=local,dest=/tmp/.buildx-cache-new,mode=max \
+            --output type=docker \
+            -t aguirresabino/app .
+          docker save aguirresabino/app | gzip > /dev/shm/docker-tmp/app.tgz
+
+      - name: Move updated cache into place
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+      # ----------- Deployment to Server -----------
 
       - name: Transfer Docker Image to Server
         uses: appleboy/scp-action@v0.1.4
@@ -35,7 +69,7 @@ jobs:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USERNAME }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          source: 'docker-compose.yml,app.tgz'
+          source: '/dev/shm/docker-tmp/app.tgz,docker-compose.yml'
           target: /app
           timeout: 10m
 
@@ -50,3 +84,7 @@ jobs:
             tar -xzf app.tgz
             docker load -i app.tgz
             docker compose up --detach --remove-orphans --wait
+
+      - name: Cleanup RAM Disk
+        if: always()
+        run: rm -rf /dev/shm/docker-tmp
